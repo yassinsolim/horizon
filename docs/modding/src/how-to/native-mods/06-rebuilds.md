@@ -46,5 +46,10 @@ the linker can open; the launcher chooses a managed ASCII path when necessary.
 
 Crates an older Cargo packaged carry file times from 1970, which FAT32 and exFAT, the usual
 formats of portable drives, can't store. When the build folder is on such a drive, Cargo's home
-moves to `%ProgramData%\horizon-launcher-<id>\cargo`, named for the build folder. The Storage page
-doesn't list that folder; uninstalling removes it with the data.
+moves to `%LOCALAPPDATA%\horizon-launcher\cargo`, this account's own folder on the system drive,
+the same one wherever the data is. The Storage page counts it in the Rust compiler row and can
+clear it, also once the data is back on a drive that takes those times; `horizon-launcher rust
+remove` and uninstalling with the data remove it too. When that path has a space or a letter
+outside ASCII, which the build tools can't read, Cargo's home stays on the drive, and a build
+that needs such a crate fails on its file times: move the data to an NTFS drive (Settings > Data
+folder).

@@ -529,9 +529,6 @@ pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<
         let location = moved_location();
         // Only a folder the launcher made: `HORIZON_LAUNCHER_HOME` may point anywhere.
         if made_by_launcher(&data, location.as_ref()) {
-            // Before the build folder goes: whether its drive takes Cargo's file times is asked
-            // of a file in it.
-            let cargo = crate::rust_toolchain::cargo_home();
             remove_all(&data, &mut left);
             // A profile whose name isn't ASCII keeps the build folder in %ProgramData%
             // (`backend::build_dir`); it is the launcher's too. Already gone with `data` otherwise.
@@ -544,23 +541,32 @@ pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<
                     builds.display()
                 ));
             }
-            // A build folder on FAT32 or exFAT keeps its Cargo home in %ProgramData%
-            // (`rust_toolchain::cargo_home`, #16702), and its folder there is then empty.
-            if !cargo.starts_with(&builds) {
-                remove_all(&cargo, &mut left);
-                if let Some(folder) = cargo.parent() {
-                    let _ = fs::remove_dir(folder);
-                }
-            }
         } else {
             left.push(format!(
                 "{} (not the launcher's own folder)",
                 data.display()
             ));
         }
+        remove_moved_cargo_home(
+            crate::rust_toolchain::moved_cargo_home().as_deref(),
+            &mut left,
+        );
     }
     progress(Step::Data, 1.0);
     Ok(left)
+}
+
+/// The Cargo home a build folder on FAT32 or exFAT keeps in this account's local app data
+/// (`rust_toolchain::moved_cargo_home`, #16702), wherever the data folder is now, and its folder
+/// there when nothing else is in it. It is the launcher's own, made for no other data.
+fn remove_moved_cargo_home(home: Option<&Path>, left: &mut Vec<String>) {
+    let Some(home) = home else {
+        return;
+    };
+    remove_all(home, left);
+    if let Some(folder) = home.parent() {
+        let _ = fs::remove_dir(folder);
+    }
 }
 
 /// After a self-update: the Uninstall entry names the new version and size. Only for the install
@@ -643,6 +649,35 @@ mod tests {
             folder_for(Path::new(r"C:\Games\horizon launcher")),
             PathBuf::from(r"C:\Games\horizon launcher")
         );
+    }
+
+    /// #16702: uninstalling with the data takes the Cargo home a build folder on FAT32 or exFAT
+    /// kept in local app data, and its folder once that is empty; a folder with more in it stays.
+    #[test]
+    fn uninstall_removes_the_moved_cargo_home() {
+        let root = std::env::temp_dir().join(format!("horizon-uninstall-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let folder = root.join("horizon-launcher");
+        let home = folder.join("cargo");
+        fs::create_dir_all(home.join("registry/src")).unwrap();
+        fs::write(home.join("registry/src/lib.rs"), b"").unwrap();
+        let mut left = Vec::new();
+        remove_moved_cargo_home(Some(&home), &mut left);
+        assert!(left.is_empty(), "{left:?}");
+        assert!(!folder.exists(), "the home, and its folder once empty");
+        remove_moved_cargo_home(Some(&home), &mut left);
+        assert!(left.is_empty(), "nothing to remove is no error: {left:?}");
+        fs::create_dir_all(home.join("registry")).unwrap();
+        fs::write(folder.join("other"), b"").unwrap();
+        remove_moved_cargo_home(Some(&home), &mut left);
+        assert!(!home.exists());
+        assert!(
+            folder.join("other").exists(),
+            "a folder with more in it stays"
+        );
+        remove_moved_cargo_home(None, &mut left);
+        assert!(left.is_empty(), "{left:?}");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     fn moved_to(folder: &str) -> Roots {

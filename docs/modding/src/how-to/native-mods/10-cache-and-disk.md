@@ -16,7 +16,9 @@ The launcher keeps these managed caches under its data folder:
 - `native/tools/`: pinned horizon-mixins executables.
 - `native/prebuilt-build/`: mod, registry dependency, patch-library and linking outputs.
 - `native/internals-sync/`: separate metadata-only discovery source and check outputs.
-- `rust/` and `cargo/`: the pinned compiler and Cargo downloads.
+- `rust/` and `cargo/`: the pinned compiler and Cargo downloads. A build folder on FAT32 or exFAT
+  keeps its Cargo downloads in `%LOCALAPPDATA%\horizon-launcher\cargo` instead
+  ([Toolchain and storage](06-rebuilds.md#toolchain-and-storage)).
 
 `native/build.log` records build diagnostics. `native-mods.json` in an installed build records its
 inputs and embedded mod inventory. Client builds share their base version's prepared resources,

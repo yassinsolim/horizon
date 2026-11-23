@@ -1383,8 +1383,12 @@ fn run_checked(
             return Ok(());
         }
         let tail: Vec<String> = tail.into();
-        let error =
-            diagnostics::with_internals_hint(failure(what, &status.to_string(), &errors, &tail));
+        let error = diagnostics::with_file_times_hint(diagnostics::with_internals_hint(failure(
+            what,
+            &status.to_string(),
+            &errors,
+            &tail,
+        )));
         Err(Ran {
             error: match blocked {
                 true => with_app_control(error),

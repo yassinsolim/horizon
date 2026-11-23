@@ -21,6 +21,7 @@ impl Storage {
             directory: Dir::open_ambient_dir(&root, cap_std::ambient_authority())?,
             root,
             lease: cache.share()?,
+            moved_cargo: crate::rust_toolchain::moved_cargo_home(),
         };
         storage.stamp_build()?;
         storage.evict()

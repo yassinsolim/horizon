@@ -402,6 +402,21 @@ impl Storage {
                 )?;
             }
         }
+        // A build folder on FAT32 or exFAT keeps its Cargo home outside it, in this account's
+        // local app data (#16702). It is listed with the build folder's own, also once the data
+        // is back on a drive that takes Cargo's file times, so the row can still clear it.
+        if let Some(home) = &self.moved_cargo {
+            if let (Some(folder), Some(name)) = (home.parent(), home.file_name()) {
+                if checked(home, true)?.is_some() {
+                    let local = Root::configured(folder)?;
+                    entries.push(Entry::fixed(
+                        &local,
+                        Path::new(name),
+                        BuildCache::Cargo.category(),
+                    )?);
+                }
+            }
+        }
         let build_files = Category::BuildFiles;
         for name in [
             "built.json",
@@ -560,6 +575,12 @@ impl Storage {
                 .truncate(true)
                 .follow(FollowSymlinks::No);
             directory.open_with(".last-used", &options)?;
+        }
+        // The Cargo home kept outside the build folder, when this build used it.
+        if let Some(home) = &self.moved_cargo {
+            if home.is_dir() && crate::rust_toolchain::cargo_home() == *home {
+                mark_used(home)?;
+            }
         }
         Ok(())
     }
@@ -1311,6 +1332,52 @@ mod eviction_tests {
             .filter(|path| path.starts_with(&target))
             .collect();
         assert_eq!(walked, [target.join("release")]);
+    }
+
+    /// #16702: the Cargo home a build folder on FAT32 or exFAT keeps in local app data is in the
+    /// Rust compiler row, counted and cleared with the build folder's own; also once the data is
+    /// back on a drive that takes Cargo's file times, as this test's build folder is.
+    #[test]
+    fn the_moved_cargo_home_is_counted_and_cleared_with_the_rust_compiler() {
+        let home = crate::storage::tests::Home::new();
+        let local = crate::storage::tests::Home::new();
+        let own = home.seed("cargo/registry/cache/own.crate");
+        let moved = local.seed("horizon-launcher/cargo/registry/cache/itoa-0.4.8.crate");
+        let mut storage = Storage::at(&home.0).unwrap();
+        let cargo = local.0.join("horizon-launcher").join("cargo");
+        storage.moved_cargo = Some(cargo.clone());
+        let entries = storage.entries().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path == cargo && entry.category == Category::RustCompiler),
+            "listed"
+        );
+        let report = storage.apply(entries, None, false).unwrap();
+        let rust = report
+            .rows
+            .iter()
+            .find(|row| row.category == Category::RustCompiler)
+            .unwrap();
+        assert!(rust.bytes >= 2 * 8192, "both homes counted: {}", rust.bytes);
+        storage
+            .apply(
+                storage.entries().unwrap(),
+                Some(Category::RustCompiler),
+                false,
+            )
+            .unwrap();
+        assert!(!moved.exists(), "the moved home is cleared");
+        assert!(!own.exists(), "and the build folder's own");
+        storage.moved_cargo = Some(local.0.join("nothing-here").join("cargo"));
+        assert!(
+            !storage
+                .entries()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path.starts_with(&local.0)),
+            "a home that isn't there isn't listed"
+        );
     }
 
     /// #19481: a `.trash-*` listed under two rows and cleared through one leaves neither row

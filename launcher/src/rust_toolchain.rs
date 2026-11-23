@@ -559,26 +559,46 @@ pub fn root() -> PathBuf {
 }
 
 /// The Cargo home of native builds (downloaded crates, horizon-mixins), never the player's own:
-/// `<build dir>/cargo`, unless files there can't take the times Cargo unpacks crates with
-/// ([`takes_cargo_times`]), which only Windows refuses.
+/// `<build dir>/cargo`, unless files there can't take the times Cargo unpacks some crates with
+/// ([`takes_cargo_times`], which only Windows refuses): then [`moved_cargo_home`], when there is one.
 pub fn cargo_home() -> PathBuf {
     let build = backend::build_dir();
-    let takes_times = !cfg!(windows) || takes_cargo_times(&build);
-    cargo_home_in(
-        &build,
-        takes_times,
-        std::env::var_os("ProgramData").map(PathBuf::from),
-    )
-}
-
-/// [`cargo_home`] for the build folder `build`. One that can't take Cargo's times keeps its
-/// crates in a folder of ProgramData's named for it (`backend::ascii_build_dir`, as for a build
-/// folder the tools can't read), on the system drive, which takes them.
-fn cargo_home_in(build: &Path, takes_times: bool, program_data: Option<PathBuf>) -> PathBuf {
-    if takes_times {
+    if !cfg!(windows) || takes_cargo_times(&build) {
         return build.join("cargo");
     }
-    backend::ascii_build_dir(build, program_data).join("cargo")
+    moved_cargo_home().unwrap_or_else(|| build.join("cargo"))
+}
+
+/// Where native builds keep their Cargo home when the build folder's drive can't take Cargo's
+/// file times (#16702): `%LOCALAPPDATA%\horizon-launcher\cargo`, this account's own folder on the
+/// system drive. Only this account (and the administrators) can write there, so another account
+/// can't plant a Cargo configuration in it, and it is the same folder wherever the data is, so
+/// `rust remove`, uninstalling and the Storage page find it after the data moves on. None off
+/// Windows, and when the build tools couldn't read the path ([`moved_cargo_home_in`]).
+pub(crate) fn moved_cargo_home() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    // A unit test never reaches the player's own folders: its scratch build folder stands in, a
+    // path the build tools can read. The real folder is resolved as `backend::build_dir` resolves
+    // the data folder, so the tools are never handed a link (a profile moved behind a junction).
+    let local = if cfg!(test) {
+        backend::build_dir().join("local")
+    } else {
+        let local = dirs::data_local_dir()?;
+        local.canonicalize().map(backend::plain).unwrap_or(local)
+    };
+    moved_cargo_home_in(&local)
+}
+
+/// [`moved_cargo_home`] in the local app data folder `local`: None when the build tools couldn't
+/// read it, with a space or a letter outside ASCII in the profile's folder name, the rule a build
+/// folder is held to (`data_location::tool_safe`). MinGW-w64's tools open paths through ANSI calls
+/// (#5189), and a crate's build script can hand them folders inside the crate, as
+/// `windows_x86_64_gnu` hands the linker its import libraries.
+fn moved_cargo_home_in(local: &Path) -> Option<PathBuf> {
+    let home = local.join("horizon-launcher").join("cargo");
+    (local.is_absolute() && crate::data_location::tool_safe(&home).is_ok()).then_some(home)
 }
 
 /// Whether files in `dir` take the time Cargo sets on the files it generated into a crate it unpacks
@@ -590,6 +610,10 @@ fn cargo_home_in(build: &Path, takes_times: bool, program_data: Option<PathBuf>)
 /// would otherwise share one file, and a name another call is deleting can't be created. A folder
 /// where none can be made is taken to take it.
 fn takes_cargo_times(dir: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(taken) = TIMES_TAKEN.with(std::cell::Cell::get) {
+        return taken;
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static PROBES: AtomicU64 = AtomicU64::new(0);
     let probe = dir.join(format!(
@@ -612,6 +636,13 @@ fn takes_cargo_times(dir: &Path) -> bool {
 /// to never sends Cargo's configuration to a shared one.
 fn time_taken(set: std::io::Result<()>) -> bool {
     !matches!(set, Err(error) if error.raw_os_error() == Some(87))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`takes_cargo_times`] answers on this test's thread instead of asking the drive: a
+    /// test can't make a FAT32 or exFAT folder.
+    static TIMES_TAKEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 fn dir_for(host: &Host) -> PathBuf {
@@ -1127,12 +1158,28 @@ fn linux_needs(ok: impl Fn(&str, &[&str]) -> bool, os: &str, full: bool) -> Resu
     ))
 }
 
-/// Removes every toolchain, the native builds' Cargo home and their scratch folder.
+/// Removes every toolchain, the native builds' Cargo homes and their scratch folder: the build
+/// folder's `cargo` and [`moved_cargo_home`] both, whichever the build folder's drive uses now.
 pub fn remove() -> Result<(), String> {
-    for dir in [root(), cargo_home(), backend::build_dir().join("tmp")] {
+    remove_in(&backend::build_dir(), moved_cargo_home().as_deref())
+}
+
+/// [`remove`] for the build folder `build` and the Cargo home `moved` keeps outside it. The
+/// folder `moved` is in (`%LOCALAPPDATA%\horizon-launcher`) goes too when nothing else is in it.
+fn remove_in(build: &Path, moved: Option<&Path>) -> Result<(), String> {
+    let dirs = [
+        Some(build.join("rust")),
+        Some(build.join("cargo")),
+        moved.map(Path::to_path_buf),
+        Some(build.join("tmp")),
+    ];
+    for dir in dirs.into_iter().flatten() {
         if dir.exists() {
             fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
+    }
+    if let Some(folder) = moved.and_then(Path::parent) {
+        let _ = fs::remove_dir(folder);
     }
     Ok(())
 }
@@ -1498,30 +1545,116 @@ mod tests {
         assert!(get("CARGO_HOME").flatten().unwrap().ends_with("cargo"));
     }
 
-    /// #16702: a build folder on FAT32 or exFAT, as on many portable drives, can't take the 1970
-    /// file times crates unpack with (Windows refuses them: os error 87), so its crates go to a
-    /// folder of ProgramData's of its own, on the system drive.
+    /// #16702: the Cargo home a build folder on FAT32 or exFAT can't keep is this account's own,
+    /// in its local app data, where the build tools can read it; nowhere when they couldn't.
     #[test]
-    fn a_build_folder_that_cant_take_cargos_file_times_keeps_its_crates_elsewhere() {
-        let build = Path::new(r"E:\Games\Horizon-data\launcher");
-        let public = PathBuf::from(if cfg!(windows) {
-            r"C:\ProgramData"
+    fn the_moved_cargo_home_is_in_local_app_data_where_the_tools_can_read_it() {
+        let local = Path::new(if cfg!(windows) {
+            r"C:\Users\pavlo\AppData\Local"
         } else {
-            "/data"
+            "/home/pavlo/.local/share"
         });
         assert_eq!(
-            cargo_home_in(build, true, Some(public.clone())),
-            build.join("cargo")
+            moved_cargo_home_in(local),
+            Some(local.join("horizon-launcher").join("cargo"))
         );
-        let home = cargo_home_in(build, false, Some(public.clone()));
-        assert_eq!(home.parent().and_then(Path::parent), Some(public.as_path()));
-        assert!(home.ends_with("cargo"), "{}", home.display());
-        let other = Path::new(r"F:\Horizon\launcher");
-        assert_ne!(
-            home,
-            cargo_home_in(other, false, Some(public)),
-            "one per folder"
+        assert_eq!(moved_cargo_home_in(Path::new("AppData")), None, "relative");
+        if cfg!(windows) {
+            for unreadable in [
+                r"C:\Users\Павло\AppData\Local",
+                r"C:\Users\Pavlo K\AppData\Local",
+            ] {
+                assert_eq!(
+                    moved_cargo_home_in(Path::new(unreadable)),
+                    None,
+                    "{unreadable}"
+                );
+            }
+        }
+    }
+
+    /// The build folder's own answer decides where a build's Cargo works: a drive that can't take
+    /// Cargo's file times sends it to [`moved_cargo_home`], and the build's command hands that
+    /// home to Cargo; an ordinary drive keeps it in the build folder.
+    #[test]
+    fn a_build_folder_that_cant_take_cargos_file_times_builds_with_the_moved_cargo_home() {
+        struct Answer;
+        impl Answer {
+            fn set(taken: bool) -> Self {
+                TIMES_TAKEN.with(|answer| answer.set(Some(taken)));
+                Answer
+            }
+        }
+        impl Drop for Answer {
+            fn drop(&mut self) {
+                TIMES_TAKEN.with(|answer| answer.set(None));
+            }
+        }
+        let build = backend::build_dir();
+        let toolchain = Toolchain {
+            dir: PathBuf::from("/rust/1.99.1-x"),
+            host: &HOSTS[0],
+        };
+        let handed = || {
+            toolchain
+                .command(&toolchain.cargo())
+                .get_envs()
+                .find(|(name, _)| *name == "CARGO_HOME")
+                .and_then(|(_, value)| value)
+                .map(PathBuf::from)
+        };
+        {
+            let _fat = Answer::set(false);
+            let moved = moved_cargo_home();
+            if cfg!(windows) {
+                assert!(
+                    moved.is_some(),
+                    "this test's folders can be read by the tools"
+                );
+            }
+            let expected = moved.unwrap_or_else(|| build.join("cargo"));
+            assert_eq!(cargo_home(), expected);
+            assert_eq!(handed(), Some(expected));
+        }
+        let _ntfs = Answer::set(true);
+        assert_eq!(cargo_home(), build.join("cargo"));
+        assert_eq!(handed(), Some(build.join("cargo")));
+    }
+
+    /// `rust remove` takes both Cargo homes, the build folder's and the moved one, whichever the
+    /// drive uses now, and the moved one's folder when nothing else is in it; nothing more.
+    #[test]
+    fn rust_remove_takes_both_cargo_homes() {
+        let root = std::env::temp_dir().join(format!("horizon-rust-remove-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let build = root.join("build");
+        let local = root.join("local").join("horizon-launcher");
+        let moved = local.join("cargo");
+        for dir in [
+            build.join("rust/1.99.1-x"),
+            build.join("cargo/registry"),
+            build.join("tmp"),
+            build.join("native"),
+            moved.join("registry/src"),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        remove_in(&build, Some(&moved)).unwrap();
+        for gone in ["rust", "cargo", "tmp"] {
+            assert!(!build.join(gone).exists(), "{gone}");
+        }
+        assert!(build.join("native").exists(), "the builds stay");
+        assert!(!local.exists(), "the moved home, and its folder once empty");
+        fs::create_dir_all(moved.join("registry")).unwrap();
+        fs::write(local.join("other"), b"").unwrap();
+        remove_in(&build, Some(&moved)).unwrap();
+        assert!(!moved.exists());
+        assert!(
+            local.join("other").exists(),
+            "a folder with more in it stays"
         );
+        remove_in(&build, None).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// An ordinary drive takes Cargo's file times, so its crates stay in the build folder, and

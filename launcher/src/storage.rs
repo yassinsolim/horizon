@@ -141,6 +141,9 @@ pub struct Storage {
     root: PathBuf,
     lease: Cache,
     directory: Dir,
+    /// The Cargo home a build folder on FAT32 or exFAT keeps outside it
+    /// (`rust_toolchain::moved_cargo_home`, #16702), listed in the Rust compiler row.
+    moved_cargo: Option<PathBuf>,
 }
 
 impl Storage {
@@ -157,6 +160,7 @@ impl Storage {
             root: root.canonicalize()?,
             directory,
             lease,
+            moved_cargo: crate::rust_toolchain::moved_cargo_home(),
         };
         storage.validate_root()?;
         Ok(storage)

@@ -962,7 +962,7 @@ fn is_link(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink() || reparse
 }
 
-fn tool_safe(path: &Path) -> Result<()> {
+pub(crate) fn tool_safe(path: &Path) -> Result<()> {
     if cfg!(windows)
         && !path
             .to_str()
