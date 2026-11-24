@@ -399,9 +399,9 @@ fn lease(progress: &dyn Fn(Step)) -> Result<Result<crate::native_cache::Cache, S
 
 /// The build lease `cache`, also holding the moved Cargo home when this build folder's builds run
 /// Cargo there (#16702): every build folder of the account shares that home, so another one's
-/// Storage clear or eviction must leave it while this build lasts. A cleanup deleting it right now
-/// is waited for, as the lease is; a home that can't be locked is told as a lease that can't be
-/// taken.
+/// Storage clear or eviction must leave it while this build lasts. The build lets go of it before
+/// its own cleanup ([`logged_then`]). A cleanup deleting it right now is waited for, as the lease
+/// is; a home that can't be locked is told as a lease that can't be taken.
 fn holding_cargo_home(
     cache: crate::native_cache::Cache,
     progress: &dyn Fn(Step),
@@ -458,8 +458,10 @@ fn logged_then<T, E: From<String>, R>(
     // exclude independent game starts; automatic trimming can conservatively retain the cache.
     // The cleanup only touches the build caches, never `versions/` where a client build is
     // installed, so a game Build and play starts from the delivered result is out of its reach.
+    // Cargo is done by now: the build lets go of the moved Cargo home first, or its own hold would
+    // keep the cleanup from ever freeing that home (#16702).
     if let Ok(cache) = cache {
-        cleanup(&cache);
+        cleanup(&cache.without_cargo_home());
     }
     delivered
 }
@@ -5390,6 +5392,62 @@ mod tests {
         );
         drop(shared);
         claim(&home).unwrap();
+    }
+
+    /// CocofireHD's review of #16806: the old-build cleanup runs under the build's lease and trims
+    /// through a share of it (`Storage::after_build`). With the build's own hold still on the moved
+    /// Cargo home, it could never claim that home. The build lets go first, so the cleanup can;
+    /// a build of another build folder still keeps it.
+    #[test]
+    fn the_cleanup_after_a_build_can_claim_the_moved_cargo_home_the_build_used() {
+        let _guard = scratch_state();
+        let claim = |home: &Path| crate::rust_toolchain::claim_moved_cargo_home(home).map(drop);
+        let scratch = tempfile::tempdir().unwrap();
+        let lease = |name: &str| {
+            let cache = crate::native_cache::Cache::acquire(&scratch.path().join(name)).unwrap();
+            holding_cargo_home(cache, &|_| {}).unwrap().unwrap()
+        };
+        let Some(home) = crate::rust_toolchain::moved_cargo_home() else {
+            return; // The Cargo home moves on Windows only.
+        };
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(home.parent().unwrap().to_path_buf());
+        let _fat = crate::rust_toolchain::TimesTaken::answer(false);
+        for another_build in [false, true] {
+            let other = another_build.then(|| lease("other"));
+            let claimed = std::cell::Cell::new(None);
+            let returned = logged_then(
+                String::clone,
+                Ok(lease("this")),
+                |cache| {
+                    assert!(cache.is_ok());
+                    // While it builds, its hold keeps every cleanup out.
+                    assert!(matches!(
+                        claim(&home),
+                        Err(crate::native_cache::Error::Busy)
+                    ));
+                    Ok::<_, String>(())
+                },
+                |result| result,
+                |cache| {
+                    let trim = cache.share().unwrap();
+                    claimed.set(Some(claim(&home).is_ok()));
+                    drop(trim);
+                },
+            );
+            assert_eq!(returned, Ok(()));
+            assert_eq!(
+                claimed.get(),
+                Some(!another_build),
+                "another build: {another_build}"
+            );
+            drop(other);
+        }
     }
 
     /// #18669: the command line's build of the installed mods whose lease can't be taken (not

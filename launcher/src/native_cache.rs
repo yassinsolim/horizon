@@ -192,9 +192,17 @@ impl Cache {
     }
 
     /// This lease, also holding `cargo_home` (the moved Cargo home's shared lock) as long as it
-    /// and every share of it last.
+    /// and every share of it last, or until [`Self::without_cargo_home`].
     pub(crate) fn holding(mut self, cargo_home: Option<Locked>) -> Self {
         self._cargo_home = cargo_home.map(std::sync::Arc::new);
+        self
+    }
+
+    /// This lease without its hold on the moved Cargo home: what a build's cleanup runs under
+    /// once Cargo is done, so the cleanup can free that home itself (#16702). The hold ends with
+    /// this, unless a share made earlier still keeps it.
+    pub(crate) fn without_cargo_home(mut self) -> Self {
+        self._cargo_home = None;
         self
     }
 

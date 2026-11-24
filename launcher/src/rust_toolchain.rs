@@ -603,8 +603,8 @@ fn moved_cargo_home_in(local: &Path) -> Option<PathBuf> {
 
 /// The lock beside the moved Cargo home `home` that keeps it whole while a build uses it. Every
 /// build folder of this account sends Cargo there, while each build's lease
-/// (`native_cache::Cache`) only covers its own build folder. A build holds the lock shared for as
-/// long as its lease lasts ([`share_moved_cargo_home`]); whatever deletes the home claims it alone,
+/// (`native_cache::Cache`) only covers its own build folder. A build holds the lock shared from its
+/// lease until its cleanup ([`share_moved_cargo_home`]); whatever deletes the home claims it alone,
 /// without waiting ([`claim_moved_cargo_home`]), and leaves the home while a build holds it.
 fn lock_moved_cargo_home(
     home: &Path,
@@ -653,6 +653,29 @@ pub(crate) fn claim_moved_cargo_home(
     home: &Path,
 ) -> Result<crate::native_cache::Locked, crate::native_cache::Error> {
     lock_moved_cargo_home(home, crate::native_cache::LockMode::Exclusive)
+}
+
+/// [`claim_moved_cargo_home`] for removing the home with its lock, when either is there; None,
+/// with nothing made, when neither is.
+pub(crate) fn claim_moved_cargo_home_to_remove(
+    home: &Path,
+) -> Result<Option<crate::native_cache::Locked>, crate::native_cache::Error> {
+    if !home.exists() && !moved_cargo_home_lock(home).exists() {
+        return Ok(None);
+    }
+    claim_moved_cargo_home(home).map(Some)
+}
+
+/// Once the moved Cargo home `home` is removed under `claim`, its lock file and its folder when
+/// nothing else is in it, removed before the claim lets go: no build can be holding that lock
+/// file then, and a build that comes after makes a new one. Let go first, a build could take the
+/// lock file in between and keep a hold on a file no later claim sees.
+pub(crate) fn remove_moved_cargo_home_lock(home: &Path, claim: crate::native_cache::Locked) {
+    let _ = fs::remove_file(moved_cargo_home_lock(home));
+    if let Some(folder) = home.parent() {
+        let _ = fs::remove_dir(folder);
+    }
+    drop(claim);
 }
 
 /// Whether files in `dir` take the time Cargo sets on the files it generated into a crate it unpacks
@@ -1238,30 +1261,35 @@ pub fn remove() -> Result<(), String> {
 }
 
 /// [`remove`] for the build folder `build` and the Cargo home `moved` keeps outside it. The moved
-/// home is claimed first ([`claim_moved_cargo_home`]): while a build of any build folder uses it,
-/// nothing is removed. Its lock stays beside it, in `%LOCALAPPDATA%\horizon-launcher`.
+/// home is claimed first ([`claim_moved_cargo_home_to_remove`]): while a build of any build folder
+/// uses it, nothing is removed. Its lock and its folder in `%LOCALAPPDATA%` go last, as
+/// uninstalling removes them ([`remove_moved_cargo_home_lock`]).
 fn remove_in(build: &Path, moved: Option<&Path>) -> Result<(), String> {
-    let moved = moved.filter(|home| home.exists());
-    let _claim = match moved {
-        Some(home) => Some(claim_moved_cargo_home(home).map_err(|error| {
-            format!(
-                "{}: {}",
-                home.display(),
-                crate::native_mods::cache_error(error)
-            )
-        })?),
+    let claim = match moved {
+        Some(home) => claim_moved_cargo_home_to_remove(home)
+            .map_err(|error| {
+                format!(
+                    "{}: {}",
+                    home.display(),
+                    crate::native_mods::cache_error(error)
+                )
+            })?
+            .map(|claim| (home, claim)),
         None => None,
     };
     let dirs = [
         Some(build.join("rust")),
         Some(build.join("cargo")),
-        moved.map(Path::to_path_buf),
+        claim.as_ref().map(|(home, _)| home.to_path_buf()),
         Some(build.join("tmp")),
     ];
     for dir in dirs.into_iter().flatten() {
         if dir.exists() {
             fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
+    }
+    if let Some((home, claim)) = claim {
+        remove_moved_cargo_home_lock(home, claim);
     }
     Ok(())
 }
@@ -1692,8 +1720,9 @@ mod tests {
     }
 
     /// `rust remove` takes both Cargo homes, the build folder's and the moved one, whichever the
-    /// drive uses now; nothing more. While a build of another build folder holds the moved home,
-    /// it removes nothing and says why.
+    /// drive uses now, with the moved one's lock and its folder once that is empty, as uninstalling
+    /// does; nothing more. While a build of another build folder holds the moved home, it removes
+    /// nothing and says why.
     #[test]
     fn rust_remove_takes_both_cargo_homes() {
         let root = std::env::temp_dir().join(format!("horizon-rust-remove-{}", std::process::id()));
@@ -1701,6 +1730,7 @@ mod tests {
         let build = root.join("build");
         let local = root.join("local").join("horizon-launcher");
         let moved = local.join("cargo");
+        let lock = moved_cargo_home_lock(&moved);
         let make = || {
             for dir in [
                 build.join("rust/1.99.1-x"),
@@ -1726,7 +1756,16 @@ mod tests {
             assert!(!build.join(gone).exists(), "{gone}");
         }
         assert!(build.join("native").exists(), "the builds stay");
-        assert!(!moved.exists(), "the moved home");
+        assert!(!local.exists(), "the moved home, its lock and its folder");
+        make();
+        drop(hold_moved_cargo_home(&moved).unwrap());
+        fs::write(local.join("other"), b"").unwrap();
+        remove_in(&build, Some(&moved)).unwrap();
+        assert!(!moved.exists() && !lock.exists());
+        assert!(
+            local.join("other").exists(),
+            "a folder with more in it stays"
+        );
         make();
         remove_in(&build, None).unwrap();
         assert!(moved.exists(), "a home that isn't named stays");

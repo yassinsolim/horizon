@@ -559,27 +559,23 @@ pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<
 /// The Cargo home a build folder on FAT32 or exFAT keeps in this account's local app data
 /// (`rust_toolchain::moved_cargo_home`, #16702), wherever the data folder is now, with its lock and
 /// its folder there when nothing else is in it. It is the launcher's own, made for no other data.
-/// While a native build of another data folder holds it, it stays, and `left` says so.
+/// While a native build of another data folder holds it, it stays, and `left` says so; the claim
+/// is held until its lock file is gone (`rust_toolchain::remove_moved_cargo_home_lock`).
 fn remove_moved_cargo_home(home: Option<&Path>, left: &mut Vec<String>) {
     let Some(home) = home else {
         return;
     };
-    if home.exists() {
-        match crate::rust_toolchain::claim_moved_cargo_home(home) {
-            Ok(_claim) => remove_all(home, left),
-            Err(error) => {
-                left.push(format!(
-                    "{} ({})",
-                    home.display(),
-                    crate::native_mods::cache_error(error)
-                ));
-                return;
-            }
+    match crate::rust_toolchain::claim_moved_cargo_home_to_remove(home) {
+        Ok(Some(claim)) => {
+            remove_all(home, left);
+            crate::rust_toolchain::remove_moved_cargo_home_lock(home, claim);
         }
-    }
-    if let Some(folder) = home.parent() {
-        let _ = fs::remove_file(crate::rust_toolchain::moved_cargo_home_lock(home));
-        let _ = fs::remove_dir(folder);
+        Ok(None) => {}
+        Err(error) => left.push(format!(
+            "{} ({})",
+            home.display(),
+            crate::native_mods::cache_error(error)
+        )),
     }
 }
 
@@ -693,6 +689,12 @@ mod tests {
         remove_moved_cargo_home(Some(&home), &mut left);
         assert!(left.is_empty(), "nothing to remove is no error: {left:?}");
         assert!(!folder.exists(), "and nothing is made");
+        // What a Storage clear leaves: the lock alone, which uninstalling takes with its folder.
+        drop(crate::rust_toolchain::hold_moved_cargo_home(&home).unwrap());
+        assert!(crate::rust_toolchain::moved_cargo_home_lock(&home).exists());
+        remove_moved_cargo_home(Some(&home), &mut left);
+        assert!(left.is_empty(), "{left:?}");
+        assert!(!folder.exists(), "a lone lock and its folder");
         fs::create_dir_all(home.join("registry")).unwrap();
         fs::write(folder.join("other"), b"").unwrap();
         remove_moved_cargo_home(Some(&home), &mut left);

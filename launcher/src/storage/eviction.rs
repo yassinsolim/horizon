@@ -14,7 +14,9 @@ fn announce(report: &Report) {
 }
 
 impl Storage {
-    /// Run inside the existing build lease, never briefly releasing its exclusion.
+    /// Run inside the existing build lease, never briefly releasing its exclusion. The build has
+    /// let go of the moved Cargo home by now (`native_mods::logged_then`), so the trim can free
+    /// that home unless a build of another build folder holds it.
     pub(crate) fn after_build(cache: &Cache) -> Result<Report, Error> {
         let root = backend::build_dir().canonicalize()?;
         let storage = Self {
