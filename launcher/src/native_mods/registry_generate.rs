@@ -62,7 +62,7 @@ pub(super) fn stage(bundle: &Bundle, output: &Path) -> Result<(), String> {
         if proc_macro && !named.is_empty() {
             return Err(crate::i18n::trf(
                 "{crate}: a proc-macro crate can't depend on the mod API; keep the API calls in the crates its macros expand into",
-                &[("crate", &relative.display().to_string())],
+                &[("crate", &portable(&relative))],
             ));
         }
         manifest.remove("bin");
@@ -88,6 +88,16 @@ pub(super) fn stage(bundle: &Bundle, output: &Path) -> Result<(), String> {
         fs::write(dest.join("inert.rs"), "").map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// A path inside the mod as its manifests write paths: `/` between the parts on every system
+/// (`crates::local_path` refuses `\`), so a refusal names `src/crates/helper` on Windows too.
+fn portable(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Validates and removes the SDK dependencies of the crate at `relative` inside the mod (the root
@@ -126,7 +136,7 @@ pub(super) fn rewrite_dependencies(
                         &[
                             ("key", key),
                             ("package", name),
-                            ("crate", &relative.display().to_string()),
+                            ("crate", &portable(relative)),
                         ],
                     ));
                 }
@@ -139,7 +149,7 @@ pub(super) fn rewrite_dependencies(
                     return Err(crate::i18n::trf(
                         "{manifest}: {key} can't be optional; the build always supplies the mod API",
                         &[
-                            ("manifest", &relative.join("Cargo.toml").display().to_string()),
+                            ("manifest", &portable(&relative.join("Cargo.toml"))),
                             ("key", key),
                         ],
                     ));
@@ -390,7 +400,11 @@ mod tests {
             "horizon-internals={path='../../../.horizon/sdk/api/crates/horizon-internals'}",
         );
         let error = rewrite("src/crates/helper").0.unwrap_err();
-        assert!(error.contains("belongs in the mod's root crate"), "{error}");
+        assert!(
+            error.ends_with("belongs in the mod's root crate, not the local crate src/crates/helper"),
+            "{error}"
+        );
+        assert_eq!(stage(&bundle, output.path()).unwrap_err(), error);
 
         // The SDK is built once with its pinned features: a local crate can't ask for others,
         // and gets the root crate's refusal for it.
