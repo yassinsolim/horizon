@@ -401,7 +401,9 @@ mod tests {
         );
         let error = rewrite("src/crates/helper").0.unwrap_err();
         assert!(
-            error.ends_with("belongs in the mod's root crate, not the local crate src/crates/helper"),
+            error.ends_with(
+                "belongs in the mod's root crate, not the local crate src/crates/helper"
+            ),
             "{error}"
         );
         assert_eq!(stage(&bundle, output.path()).unwrap_err(), error);
