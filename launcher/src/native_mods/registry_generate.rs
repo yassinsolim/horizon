@@ -141,6 +141,10 @@ pub(super) fn generate(bundle: &Bundle, update: bool) -> Result<(), String> {
     let work = tempfile::tempdir_in(super::root()).map_err(|e| e.to_string())?;
     stage(bundle, work.path())?;
     let rust = crate::rust_toolchain::install(|_| {})?;
+    // Cargo resolves in the Cargo home: a moved one is held while it does, as a build holds it
+    // (#16702), so another build folder's cleanup leaves it.
+    let _cargo_home =
+        crate::rust_toolchain::share_moved_cargo_home().map_err(super::cache_error)?;
     let command = super::cargo(&rust, work.path(), "generate-lockfile");
     super::run(command, "Resolving registry dependency pins", |_| {})?;
     let text = super::read_lock(work.path())?;

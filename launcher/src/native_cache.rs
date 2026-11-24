@@ -45,6 +45,9 @@ pub(crate) struct Cache {
     root: PathBuf,
     directory: Dir,
     _lease: std::sync::Arc<Locked>,
+    /// The moved Cargo home's lock, shared, while this lease's builds run Cargo there
+    /// (`rust_toolchain::share_moved_cargo_home`): another build folder's cleanup leaves it.
+    _cargo_home: Option<std::sync::Arc<Locked>>,
 }
 
 pub(crate) use horizon_platform::mod_package::locks::{LockMode, Locked, Release};
@@ -184,7 +187,15 @@ impl Cache {
             root: self.root.clone(),
             directory: self.directory.try_clone()?,
             _lease: self._lease.clone(),
+            _cargo_home: self._cargo_home.clone(),
         })
+    }
+
+    /// This lease, also holding `cargo_home` (the moved Cargo home's shared lock) as long as it
+    /// and every share of it last.
+    pub(crate) fn holding(mut self, cargo_home: Option<Locked>) -> Self {
+        self._cargo_home = cargo_home.map(std::sync::Arc::new);
+        self
     }
 
     /// One cross-process lease covers staging, Cargo, installation/export and cleanup.
@@ -196,6 +207,7 @@ impl Cache {
             root,
             directory,
             _lease: std::sync::Arc::new(lease),
+            _cargo_home: None,
         })
     }
 

@@ -381,7 +381,35 @@ fn lease(progress: &dyn Fn(Step)) -> Result<Result<crate::native_cache::Cache, S
     loop {
         match crate::native_cache::Cache::acquire(&backend::build_dir()) {
             // Stop pressed as the holder let go still ends the build here, before anything.
-            Ok(cache) => return check_cancelled().map(|()| Ok(cache)),
+            Ok(cache) => {
+                check_cancelled()?;
+                return holding_cargo_home(cache, progress);
+            }
+            Err(crate::native_cache::Error::Busy) => {}
+            Err(error) => return Ok(Err(cache_error(error))),
+        }
+        if !waiting {
+            waiting = true;
+            progress(Step::Busy);
+        }
+        check_cancelled()?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The build lease `cache`, also holding the moved Cargo home when this build folder's builds run
+/// Cargo there (#16702): every build folder of the account shares that home, so another one's
+/// Storage clear or eviction must leave it while this build lasts. A cleanup deleting it right now
+/// is waited for, as the lease is; a home that can't be locked is told as a lease that can't be
+/// taken.
+fn holding_cargo_home(
+    cache: crate::native_cache::Cache,
+    progress: &dyn Fn(Step),
+) -> Result<Result<crate::native_cache::Cache, String>, String> {
+    let mut waiting = false;
+    loop {
+        match crate::rust_toolchain::share_moved_cargo_home() {
+            Ok(home) => return Ok(Ok(cache.holding(home))),
             Err(crate::native_cache::Error::Busy) => {}
             Err(error) => return Ok(Err(cache_error(error))),
         }
@@ -5320,6 +5348,48 @@ mod tests {
             "{:?}",
             result.map_err(String::from)
         );
+    }
+
+    /// #16702: a build whose Cargo runs in the moved Cargo home holds that home for as long as its
+    /// lease and every share of it last, so another build folder's cleanup can't claim it; a build
+    /// whose build folder keeps its own Cargo home takes nothing outside its lease.
+    #[test]
+    fn a_build_holds_the_moved_cargo_home_for_as_long_as_its_lease() {
+        let claim = |home: &Path| crate::rust_toolchain::claim_moved_cargo_home(home).map(drop);
+        let scratch = tempfile::tempdir().unwrap();
+        let lease = |name: &str| {
+            let cache = crate::native_cache::Cache::acquire(&scratch.path().join(name)).unwrap();
+            holding_cargo_home(cache, &|_| {}).unwrap().unwrap()
+        };
+        let Some(home) = crate::rust_toolchain::moved_cargo_home() else {
+            return; // The Cargo home moves on Windows only.
+        };
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(home.parent().unwrap().to_path_buf());
+        {
+            let _ntfs = crate::rust_toolchain::TimesTaken::answer(true);
+            let _build = lease("ntfs");
+            claim(&home).expect("nothing is held outside the lease");
+        }
+        let _fat = crate::rust_toolchain::TimesTaken::answer(false);
+        let build = lease("fat");
+        let shared = build.share().unwrap();
+        assert!(matches!(
+            claim(&home),
+            Err(crate::native_cache::Error::Busy)
+        ));
+        drop(build);
+        assert!(
+            matches!(claim(&home), Err(crate::native_cache::Error::Busy)),
+            "a share of the lease holds it too"
+        );
+        drop(shared);
+        claim(&home).unwrap();
     }
 
     /// #18669: the command line's build of the installed mods whose lease can't be taken (not

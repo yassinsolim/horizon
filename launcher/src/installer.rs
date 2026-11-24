@@ -557,14 +557,28 @@ pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<
 }
 
 /// The Cargo home a build folder on FAT32 or exFAT keeps in this account's local app data
-/// (`rust_toolchain::moved_cargo_home`, #16702), wherever the data folder is now, and its folder
-/// there when nothing else is in it. It is the launcher's own, made for no other data.
+/// (`rust_toolchain::moved_cargo_home`, #16702), wherever the data folder is now, with its lock and
+/// its folder there when nothing else is in it. It is the launcher's own, made for no other data.
+/// While a native build of another data folder holds it, it stays, and `left` says so.
 fn remove_moved_cargo_home(home: Option<&Path>, left: &mut Vec<String>) {
     let Some(home) = home else {
         return;
     };
-    remove_all(home, left);
+    if home.exists() {
+        match crate::rust_toolchain::claim_moved_cargo_home(home) {
+            Ok(_claim) => remove_all(home, left),
+            Err(error) => {
+                left.push(format!(
+                    "{} ({})",
+                    home.display(),
+                    crate::native_mods::cache_error(error)
+                ));
+                return;
+            }
+        }
+    }
     if let Some(folder) = home.parent() {
+        let _ = fs::remove_file(crate::rust_toolchain::moved_cargo_home_lock(home));
         let _ = fs::remove_dir(folder);
     }
 }
@@ -652,7 +666,8 @@ mod tests {
     }
 
     /// #16702: uninstalling with the data takes the Cargo home a build folder on FAT32 or exFAT
-    /// kept in local app data, and its folder once that is empty; a folder with more in it stays.
+    /// kept in local app data, its lock, and its folder once that is empty; a folder with more in
+    /// it stays. While a native build of another data folder holds the home, it stays and is named.
     #[test]
     fn uninstall_removes_the_moved_cargo_home() {
         let root = std::env::temp_dir().join(format!("horizon-uninstall-{}", std::process::id()));
@@ -662,11 +677,22 @@ mod tests {
         fs::create_dir_all(home.join("registry/src")).unwrap();
         fs::write(home.join("registry/src/lib.rs"), b"").unwrap();
         let mut left = Vec::new();
+        let held = crate::rust_toolchain::hold_moved_cargo_home(&home).unwrap();
+        remove_moved_cargo_home(Some(&home), &mut left);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].starts_with(&home.display().to_string()), "{left:?}");
+        assert!(home.join("registry/src/lib.rs").exists(), "kept while held");
+        drop(held);
+        left.clear();
         remove_moved_cargo_home(Some(&home), &mut left);
         assert!(left.is_empty(), "{left:?}");
-        assert!(!folder.exists(), "the home, and its folder once empty");
+        assert!(
+            !folder.exists(),
+            "the home, its lock, and its folder once empty"
+        );
         remove_moved_cargo_home(Some(&home), &mut left);
         assert!(left.is_empty(), "nothing to remove is no error: {left:?}");
+        assert!(!folder.exists(), "and nothing is made");
         fs::create_dir_all(home.join("registry")).unwrap();
         fs::write(folder.join("other"), b"").unwrap();
         remove_moved_cargo_home(Some(&home), &mut left);

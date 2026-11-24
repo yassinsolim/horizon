@@ -103,6 +103,9 @@ struct Entry {
     links: Links,
     /// The instance folder this unit is in: its delete holds that instance against launches.
     instance: Option<PathBuf>,
+    /// The moved Cargo home (#16702), which every build folder of the account shares: a clear
+    /// claims its lock first, and leaves it while a build of another build folder holds it.
+    moved_cargo_home: bool,
 }
 
 impl Entry {
@@ -127,6 +130,7 @@ impl Entry {
             path,
             links: Links::Refused,
             instance: None,
+            moved_cargo_home: false,
         })
     }
 
@@ -306,6 +310,13 @@ impl Entry {
             );
         }
         access.check(crate::cache_cleanup::Proof::Lease)?;
+        // This build folder's lease doesn't cover a build of another one, which may be using the
+        // moved Cargo home: Busy (kept) while one holds it.
+        let _claim = if self.moved_cargo_home {
+            Some(crate::rust_toolchain::claim_moved_cargo_home(&self.path)?)
+        } else {
+            None
+        };
         let mut parent = root.try_clone()?;
         for part in self.relative.parent().unwrap_or(Path::new("")).components() {
             parent = parent.open_dir_nofollow(part.as_os_str())?;
@@ -409,11 +420,10 @@ impl Storage {
             if let (Some(folder), Some(name)) = (home.parent(), home.file_name()) {
                 if checked(home, true)?.is_some() {
                     let local = Root::configured(folder)?;
-                    entries.push(Entry::fixed(
-                        &local,
-                        Path::new(name),
-                        BuildCache::Cargo.category(),
-                    )?);
+                    let mut entry =
+                        Entry::fixed(&local, Path::new(name), BuildCache::Cargo.category())?;
+                    entry.moved_cargo_home = true;
+                    entries.push(entry);
                 }
             }
         }
@@ -1378,6 +1388,47 @@ mod eviction_tests {
                 .any(|entry| entry.path.starts_with(&local.0)),
             "a home that isn't there isn't listed"
         );
+    }
+
+    /// #16702: the moved Cargo home is every build folder's, and this build folder's lease
+    /// doesn't cover a build of another one. While such a build holds the home, as its lease does
+    /// (`native_mods::lease`), the Rust compiler row's clear keeps it and says why; once the build
+    /// has let go, the clear takes it. Eviction clears through the same `Entry::clear`.
+    #[test]
+    fn a_build_of_another_build_folder_keeps_the_moved_cargo_home_from_this_ones_clear() {
+        let home = crate::storage::tests::Home::new();
+        let local = crate::storage::tests::Home::new();
+        let other = crate::storage::tests::Home::new();
+        let moved = local.seed("horizon-launcher/cargo/registry/cache/itoa-0.4.8.crate");
+        let cargo = local.0.join("horizon-launcher").join("cargo");
+        let mut storage = Storage::at(&home.0).unwrap();
+        storage.moved_cargo = Some(cargo.clone());
+        let build = Cache::acquire(&other.0).unwrap().holding(Some(
+            crate::rust_toolchain::hold_moved_cargo_home(&cargo).unwrap(),
+        ));
+        let clear = |storage: &Storage| {
+            storage
+                .apply_retaining(
+                    storage.entries().unwrap(),
+                    Some(Category::RustCompiler),
+                    false,
+                    true,
+                )
+                .unwrap()
+        };
+        let report = clear(&storage);
+        assert!(moved.exists(), "kept while the other build holds it");
+        let kept: Vec<&str> = report
+            .rows
+            .iter()
+            .filter(|row| row.category == Category::RustCompiler)
+            .flat_map(|row| &row.kept)
+            .map(|kept| kept.reason.as_str())
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        drop(build);
+        clear(&storage);
+        assert!(!moved.exists(), "cleared once it let go");
     }
 
     /// #19481: a `.trash-*` listed under two rows and cleared through one leaves neither row

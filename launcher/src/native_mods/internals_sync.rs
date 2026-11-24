@@ -139,7 +139,9 @@ impl DiscoveryCatalog {
 /// Hold the returned catalog while reading its internals.json and points.json files.
 pub fn pinned_catalog_with_modules(folder: &Path) -> Result<DiscoveryCatalog, String> {
     super::require_consent().map_err(|e| e.to_string())?;
+    // Discovery runs Cargo too, so it holds the moved Cargo home as a build does (#16702).
     let lease = crate::native_cache::Cache::acquire(&crate::backend::build_dir())
+        .and_then(|lease| Ok(lease.holding(crate::rust_toolchain::share_moved_cargo_home()?)))
         .map_err(super::cache_error)?;
     super::clear_log()?;
     let directory = catalog_for_mod(folder, &super::root().join("internals-sync"))

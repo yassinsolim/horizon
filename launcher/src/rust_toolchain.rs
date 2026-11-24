@@ -601,6 +601,60 @@ fn moved_cargo_home_in(local: &Path) -> Option<PathBuf> {
     (local.is_absolute() && crate::data_location::tool_safe(&home).is_ok()).then_some(home)
 }
 
+/// The lock beside the moved Cargo home `home` that keeps it whole while a build uses it. Every
+/// build folder of this account sends Cargo there, while each build's lease
+/// (`native_cache::Cache`) only covers its own build folder. A build holds the lock shared for as
+/// long as its lease lasts ([`share_moved_cargo_home`]); whatever deletes the home claims it alone,
+/// without waiting ([`claim_moved_cargo_home`]), and leaves the home while a build holds it.
+fn lock_moved_cargo_home(
+    home: &Path,
+    mode: crate::native_cache::LockMode,
+) -> Result<crate::native_cache::Locked, crate::native_cache::Error> {
+    let lock = moved_cargo_home_lock(home);
+    if let Some(folder) = lock.parent() {
+        fs::create_dir_all(folder)?;
+    }
+    crate::native_cache::checked(&lock, false)?;
+    let file = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)?;
+    crate::native_cache::locked(file, mode)
+}
+
+/// [`lock_moved_cargo_home`]'s file, beside the moved Cargo home `home`.
+pub(crate) fn moved_cargo_home_lock(home: &Path) -> PathBuf {
+    home.with_file_name(".cargo-home.lock")
+}
+
+/// The moved Cargo home's lock, shared, when this build folder's builds run Cargo there now
+/// ([`cargo_home`]); None when they use the build folder's own `cargo`, which the build lease
+/// covers. `Error::Busy` while something is deleting the home.
+pub(crate) fn share_moved_cargo_home(
+) -> Result<Option<crate::native_cache::Locked>, crate::native_cache::Error> {
+    match moved_cargo_home() {
+        Some(home) if cargo_home() == home => hold_moved_cargo_home(&home).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// [`share_moved_cargo_home`] for the moved Cargo home `home`.
+pub(crate) fn hold_moved_cargo_home(
+    home: &Path,
+) -> Result<crate::native_cache::Locked, crate::native_cache::Error> {
+    lock_moved_cargo_home(home, crate::native_cache::LockMode::Shared)
+}
+
+/// The moved Cargo home `home`'s lock, alone, for deleting the home: `Error::Busy` while a build
+/// of any build folder holds it.
+pub(crate) fn claim_moved_cargo_home(
+    home: &Path,
+) -> Result<crate::native_cache::Locked, crate::native_cache::Error> {
+    lock_moved_cargo_home(home, crate::native_cache::LockMode::Exclusive)
+}
+
 /// Whether files in `dir` take the time Cargo sets on the files it generated into a crate it unpacks
 /// (`Cargo.toml`, `.cargo_vcs_info.json`): 1970-01-01, one second in, in crates an older Cargo
 /// packaged (`itoa` 0.4.8, `cargo-platform` 0.1.9; newer ones carry 2006-07-24). FAT32's and
@@ -643,6 +697,25 @@ thread_local! {
     /// What [`takes_cargo_times`] answers on this test's thread instead of asking the drive: a
     /// test can't make a FAT32 or exFAT folder.
     static TIMES_TAKEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes [`takes_cargo_times`] answer `taken` on this test's thread until it is dropped.
+#[cfg(test)]
+pub(crate) struct TimesTaken;
+
+#[cfg(test)]
+impl TimesTaken {
+    pub(crate) fn answer(taken: bool) -> Self {
+        TIMES_TAKEN.with(|answer| answer.set(Some(taken)));
+        TimesTaken
+    }
+}
+
+#[cfg(test)]
+impl Drop for TimesTaken {
+    fn drop(&mut self) {
+        TIMES_TAKEN.with(|answer| answer.set(None));
+    }
 }
 
 fn dir_for(host: &Host) -> PathBuf {
@@ -1164,9 +1237,21 @@ pub fn remove() -> Result<(), String> {
     remove_in(&backend::build_dir(), moved_cargo_home().as_deref())
 }
 
-/// [`remove`] for the build folder `build` and the Cargo home `moved` keeps outside it. The
-/// folder `moved` is in (`%LOCALAPPDATA%\horizon-launcher`) goes too when nothing else is in it.
+/// [`remove`] for the build folder `build` and the Cargo home `moved` keeps outside it. The moved
+/// home is claimed first ([`claim_moved_cargo_home`]): while a build of any build folder uses it,
+/// nothing is removed. Its lock stays beside it, in `%LOCALAPPDATA%\horizon-launcher`.
 fn remove_in(build: &Path, moved: Option<&Path>) -> Result<(), String> {
+    let moved = moved.filter(|home| home.exists());
+    let _claim = match moved {
+        Some(home) => Some(claim_moved_cargo_home(home).map_err(|error| {
+            format!(
+                "{}: {}",
+                home.display(),
+                crate::native_mods::cache_error(error)
+            )
+        })?),
+        None => None,
+    };
     let dirs = [
         Some(build.join("rust")),
         Some(build.join("cargo")),
@@ -1177,9 +1262,6 @@ fn remove_in(build: &Path, moved: Option<&Path>) -> Result<(), String> {
         if dir.exists() {
             fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-    }
-    if let Some(folder) = moved.and_then(Path::parent) {
-        let _ = fs::remove_dir(folder);
     }
     Ok(())
 }
@@ -1578,18 +1660,6 @@ mod tests {
     /// home to Cargo; an ordinary drive keeps it in the build folder.
     #[test]
     fn a_build_folder_that_cant_take_cargos_file_times_builds_with_the_moved_cargo_home() {
-        struct Answer;
-        impl Answer {
-            fn set(taken: bool) -> Self {
-                TIMES_TAKEN.with(|answer| answer.set(Some(taken)));
-                Answer
-            }
-        }
-        impl Drop for Answer {
-            fn drop(&mut self) {
-                TIMES_TAKEN.with(|answer| answer.set(None));
-            }
-        }
         let build = backend::build_dir();
         let toolchain = Toolchain {
             dir: PathBuf::from("/rust/1.99.1-x"),
@@ -1604,7 +1674,7 @@ mod tests {
                 .map(PathBuf::from)
         };
         {
-            let _fat = Answer::set(false);
+            let _fat = TimesTaken::answer(false);
             let moved = moved_cargo_home();
             if cfg!(windows) {
                 assert!(
@@ -1616,13 +1686,14 @@ mod tests {
             assert_eq!(cargo_home(), expected);
             assert_eq!(handed(), Some(expected));
         }
-        let _ntfs = Answer::set(true);
+        let _ntfs = TimesTaken::answer(true);
         assert_eq!(cargo_home(), build.join("cargo"));
         assert_eq!(handed(), Some(build.join("cargo")));
     }
 
     /// `rust remove` takes both Cargo homes, the build folder's and the moved one, whichever the
-    /// drive uses now, and the moved one's folder when nothing else is in it; nothing more.
+    /// drive uses now; nothing more. While a build of another build folder holds the moved home,
+    /// it removes nothing and says why.
     #[test]
     fn rust_remove_takes_both_cargo_homes() {
         let root = std::env::temp_dir().join(format!("horizon-rust-remove-{}", std::process::id()));
@@ -1630,30 +1701,35 @@ mod tests {
         let build = root.join("build");
         let local = root.join("local").join("horizon-launcher");
         let moved = local.join("cargo");
-        for dir in [
-            build.join("rust/1.99.1-x"),
-            build.join("cargo/registry"),
-            build.join("tmp"),
-            build.join("native"),
-            moved.join("registry/src"),
-        ] {
-            fs::create_dir_all(dir).unwrap();
+        let make = || {
+            for dir in [
+                build.join("rust/1.99.1-x"),
+                build.join("cargo/registry"),
+                build.join("tmp"),
+                build.join("native"),
+                moved.join("registry/src"),
+            ] {
+                fs::create_dir_all(dir).unwrap();
+            }
+        };
+        make();
+        let held = hold_moved_cargo_home(&moved).unwrap();
+        let refused = remove_in(&build, Some(&moved)).unwrap_err();
+        assert!(refused.contains(&moved.display().to_string()), "{refused}");
+        for kept in ["rust", "cargo", "tmp"] {
+            assert!(build.join(kept).exists(), "{kept} stays while it's refused");
         }
+        assert!(moved.join("registry/src").exists());
+        drop(held);
         remove_in(&build, Some(&moved)).unwrap();
         for gone in ["rust", "cargo", "tmp"] {
             assert!(!build.join(gone).exists(), "{gone}");
         }
         assert!(build.join("native").exists(), "the builds stay");
-        assert!(!local.exists(), "the moved home, and its folder once empty");
-        fs::create_dir_all(moved.join("registry")).unwrap();
-        fs::write(local.join("other"), b"").unwrap();
-        remove_in(&build, Some(&moved)).unwrap();
-        assert!(!moved.exists());
-        assert!(
-            local.join("other").exists(),
-            "a folder with more in it stays"
-        );
+        assert!(!moved.exists(), "the moved home");
+        make();
         remove_in(&build, None).unwrap();
+        assert!(moved.exists(), "a home that isn't named stays");
         fs::remove_dir_all(&root).unwrap();
     }
 
