@@ -610,18 +610,34 @@ fn lock_moved_cargo_home(
     home: &Path,
     mode: crate::native_cache::LockMode,
 ) -> Result<crate::native_cache::Locked, crate::native_cache::Error> {
+    let holder = matches!(mode, crate::native_cache::LockMode::Shared);
+    let file = open_moved_cargo_home_lock(home, holder)?;
+    crate::native_cache::locked(file, mode)
+}
+
+/// [`lock_moved_cargo_home`]'s file, opened, for a `holder` or a claim. On Windows a holder's open
+/// doesn't share deletion, so [`remove_moved_cargo_home_lock`] can't unlink the file while a build
+/// has it open, even before the build has locked it.
+fn open_moved_cargo_home_lock(
+    home: &Path,
+    holder: bool,
+) -> Result<fs::File, crate::native_cache::Error> {
     let lock = moved_cargo_home_lock(home);
     if let Some(folder) = lock.parent() {
         fs::create_dir_all(folder)?;
     }
     crate::native_cache::checked(&lock, false)?;
-    let file = fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock)?;
-    crate::native_cache::locked(file, mode)
+    let mut options = fs::File::options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    if holder {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    #[cfg(not(windows))]
+    let _ = holder;
+    Ok(options.open(&lock)?)
 }
 
 /// [`lock_moved_cargo_home`]'s file, beside the moved Cargo home `home`.
@@ -667,9 +683,11 @@ pub(crate) fn claim_moved_cargo_home_to_remove(
 }
 
 /// Once the moved Cargo home `home` is removed under `claim`, its lock file and its folder when
-/// nothing else is in it, removed before the claim lets go: no build can be holding that lock
-/// file then, and a build that comes after makes a new one. Let go first, a build could take the
-/// lock file in between and keep a hold on a file no later claim sees.
+/// nothing else is in it, removed before the claim lets go: no build holds that lock file then,
+/// and a build that comes after makes a new one. A build that has opened it but not yet locked it
+/// keeps it there ([`open_moved_cargo_home_lock`]), so its hold is on the file later claims see.
+/// Let go first, a build could take the lock file in between and keep a hold on a file no later
+/// claim sees.
 pub(crate) fn remove_moved_cargo_home_lock(home: &Path, claim: crate::native_cache::Locked) {
     let _ = fs::remove_file(moved_cargo_home_lock(home));
     if let Some(folder) = home.parent() {
@@ -1769,6 +1787,32 @@ mod tests {
         make();
         remove_in(&build, None).unwrap();
         assert!(moved.exists(), "a home that isn't named stays");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A build that has opened the moved home's lock file but not yet locked it, while `rust
+    /// remove` or uninstalling removes that file under its claim: the file stays, so the build's
+    /// hold is on the file the next claim sees, and goes once no build has it open.
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_file_a_build_has_open_stays() {
+        let root = std::env::temp_dir().join(format!("horizon-home-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("horizon-launcher").join("cargo");
+        fs::create_dir_all(&home).unwrap();
+        let lock = moved_cargo_home_lock(&home);
+        let opened = open_moved_cargo_home_lock(&home, true).unwrap();
+        remove_moved_cargo_home_lock(&home, claim_moved_cargo_home(&home).unwrap());
+        assert!(lock.exists(), "kept while a build has it open");
+        let held =
+            crate::native_cache::locked(opened, crate::native_cache::LockMode::Shared).unwrap();
+        assert!(matches!(
+            claim_moved_cargo_home(&home),
+            Err(crate::native_cache::Error::Busy)
+        ));
+        drop(held);
+        remove_moved_cargo_home_lock(&home, claim_moved_cargo_home(&home).unwrap());
+        assert!(!lock.exists(), "removed once no build has it open");
         fs::remove_dir_all(&root).unwrap();
     }
 
