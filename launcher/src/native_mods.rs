@@ -5357,6 +5357,8 @@ mod tests {
     /// whose build folder keeps its own Cargo home takes nothing outside its lease.
     #[test]
     fn a_build_holds_the_moved_cargo_home_for_as_long_as_its_lease() {
+        // The moved home is this process's one scratch folder: one test at a time uses it.
+        let _guard = scratch_state();
         let claim = |home: &Path| crate::rust_toolchain::claim_moved_cargo_home(home).map(drop);
         let scratch = tempfile::tempdir().unwrap();
         let lease = |name: &str| {
